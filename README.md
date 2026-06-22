@@ -1,92 +1,112 @@
-# codex-proxy
+# Codex macOS Proxy Launcher
 
-`codex-proxy` 是一个很小的 macOS 启动器。它启动后会停止当前 Codex，并用本机 V2Ray/Xray 代理重新打开 `/Applications/Codex.app`，设置完成后自动退出。
+[English](README.md) | [Simplified Chinese](README.zh-CN.md)
 
-它主要解决 Codex 在只开启系统代理时仍可能有部分后台服务不走代理的问题，例如远程连接、`codex app-server`、Node 子进程、Chromium NetworkService 等。
+`codex-proxy` is a small macOS launcher for Codex. It stops the currently
+running Codex app, relaunches `/Applications/Codex.app` with local V2Ray/Xray
+proxy settings, and then exits.
 
-## 特点
+The launcher is useful when system proxy settings do not cover every Codex
+background process, such as remote connections, `codex app-server`, Node child
+processes, or Chromium NetworkService.
 
-- 一键重启 Codex，并在启动时注入代理环境。
-- 启动器本身不会常驻；成功打开 Codex 后自动退出。
-- 同时覆盖 Codex 的 Node 后台服务和 Electron/Chromium 网络层。
-- 使用本机 `/Applications/Codex.app` 的图标，安装后显示为 `codex-proxy.app`。
-- 默认面向 V2Ray/Xray 的本机 mixed inbound 端口 `127.0.0.1:10808`。
+## Features
 
-## 端口说明
+- Relaunches Codex with proxy environment variables injected at startup.
+- Does not stay resident after Codex has been opened successfully.
+- Covers both Codex Node background services and the Electron/Chromium network
+  layer.
+- Uses the local `/Applications/Codex.app` icon and installs as
+  `codex-proxy.app`.
+- Defaults to the local V2Ray/Xray mixed inbound at `127.0.0.1:10808`.
 
-默认端口是 `127.0.0.1:10808`。这个端口通常是 V2Ray/Xray 客户端的 mixed 入口，可以在同一个端口上同时接受 HTTP CONNECT 和 SOCKS5。
+## Proxy Port
 
-因此启动器会同时设置 HTTP(S) 和 SOCKS5：
+The default proxy endpoint is `127.0.0.1:10808`. This is commonly used by
+V2Ray/Xray clients as a mixed inbound that accepts both HTTP CONNECT and SOCKS5
+traffic on the same port.
+
+The launcher sets HTTP(S) and SOCKS variables:
 
 - `HTTP_PROXY`
 - `HTTPS_PROXY`
 - `ALL_PROXY`
 - `SOCKS_PROXY`
-- 对应的小写变量
+- lowercase variants
 - `npm_config_proxy`
 - `npm_config_https_proxy`
 
-注意：`HTTPS_PROXY` 的值是 `http://127.0.0.1:10808`，这是正常的。这里的 `http://` 表示“连接到本地代理所使用的协议”，不是目标网站的协议；HTTPS 请求会通过 HTTP CONNECT 隧道走这个 mixed 端口。
+`HTTPS_PROXY` is set to `http://127.0.0.1:10808` intentionally. The `http://`
+scheme describes how the client talks to the local proxy; HTTPS traffic still
+uses an HTTP CONNECT tunnel through that proxy.
 
-`ALL_PROXY` 和 `SOCKS_PROXY` 使用 `socks5://127.0.0.1:10808`，用于支持优先读取 SOCKS5 代理变量的后台服务。
+`ALL_PROXY` and `SOCKS_PROXY` are set to `socks5://127.0.0.1:10808` for
+services that prefer SOCKS5 proxy variables.
 
-启动器也会给 Codex 传入 Chromium 参数：
+The launcher also passes Chromium proxy arguments to Codex:
 
 ```text
 --proxy-server=http=127.0.0.1:10808;https=127.0.0.1:10808;socks=socks5://127.0.0.1:10808
 --proxy-bypass-list=localhost;127.0.0.1;::1
 ```
 
-`localhost`、`127.0.0.1` 和 `::1` 会被绕过，避免 Codex 内部本地服务被错误送进代理。
+`localhost`, `127.0.0.1`, and `::1` are bypassed so Codex local services are not
+sent through the proxy.
 
-## 使用
+## Usage
 
-安装后直接打开：
+Open the installed launcher:
 
 ```text
 /Applications/codex-proxy.app
 ```
 
-它会立刻重启 Codex。这个行为是设计如此，因为只有重新启动 Codex，代理环境变量和 Chromium 启动参数才会被新进程继承。
+It immediately restarts Codex. This is intentional because proxy environment
+variables and Chromium launch arguments must be inherited by the new Codex
+process.
 
-## 构建
+## Build
 
 ```bash
 ./script/build_and_run.sh --build-only
 ```
 
-构建完成后，应用会在：
+The app is created at:
 
 ```text
 dist/codex-proxy.app
 ```
 
-## 安装
+## Install
 
 ```bash
 ./script/build_and_run.sh --install
 ```
 
-安装位置：
+Install location:
 
 ```text
 /Applications/codex-proxy.app
 ```
 
-直接打开这个 app 会重启 Codex，然后自动退出。
+Opening the app restarts Codex and then exits.
 
-## 验证
+## Verify
 
-可以用下面的命令确认 Codex 是否带着代理启动：
+Check that Codex was launched with the proxy argument:
 
 ```bash
 ps ax -o pid=,args= | rg '/Applications/Codex.app/Contents/MacOS/Codex'
 ```
 
-应能看到 `--proxy-server=...10808...`。
+The output should include `--proxy-server=...10808...`.
 
-也可以检查 Codex 子进程是否连接到了 V2Ray/Xray：
+You can also check whether Codex child processes are connected to V2Ray/Xray:
 
 ```bash
 lsof -nP -iTCP@127.0.0.1:10808
 ```
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
