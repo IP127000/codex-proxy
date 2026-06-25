@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import os
 
@@ -7,6 +8,8 @@ private let codexBundleID = "com.openai.codex"
 private let codexPath = "/Applications/Codex.app"
 
 private let proxy = ProxySettings(host: "127.0.0.1", port: 10808)
+private let gracefulShutdownTimeout: TimeInterval = 5
+private let residualShutdownTimeout: TimeInterval = 3
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let launcher = CodexProxyLauncher()
@@ -67,6 +70,8 @@ private final class CodexProxyLauncher {
             }
             return app.bundleURL?.standardizedFileURL.path == targetPath
         }
+        let codexRootPIDs = Set(runningCodexApps.map { Int32($0.processIdentifier) })
+        let knownRelatedPIDs = await collectCodexRelatedProcessIDs(rootPIDs: codexRootPIDs)
 
         for app in runningCodexApps {
             logger.info("Terminating Codex pid=\(app.processIdentifier, privacy: .public)")
@@ -75,7 +80,7 @@ private final class CodexProxyLauncher {
             }
         }
 
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(gracefulShutdownTimeout)
         while Date() < deadline {
             let stillRunning = runningCodexApps.contains { !$0.isTerminated }
             if !stillRunning { break }
@@ -87,40 +92,129 @@ private final class CodexProxyLauncher {
             app.forceTerminate()
         }
 
-        await terminateResidualCodexHelpers()
+        await terminateResidualCodexHelpers(previouslySeenPIDs: knownRelatedPIDs, rootPIDs: codexRootPIDs)
         try? await Task.sleep(nanoseconds: 700_000_000)
     }
 
-    private func terminateResidualCodexHelpers() async {
-        let patterns = [
-            "^/Applications/Codex\\.app/"
-        ]
+    private func terminateResidualCodexHelpers(previouslySeenPIDs: Set<Int32>, rootPIDs: Set<Int32>) async {
+        var residualPIDs = previouslySeenPIDs
+        residualPIDs.formUnion(await collectCodexRelatedProcessIDs(rootPIDs: rootPIDs))
+        residualPIDs.remove(Int32(ProcessInfo.processInfo.processIdentifier))
+        residualPIDs = residualPIDs.filter { isProcessRunning($0) }
 
-        for pattern in patterns {
-            await runProcess("/usr/bin/pkill", arguments: ["-TERM", "-f", pattern])
+        if residualPIDs.isEmpty {
+            logger.info("No residual Codex helper processes found")
+            return
         }
 
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        for pid in residualPIDs.sorted() {
+            logger.info("Terminating residual Codex helper pid=\(pid, privacy: .public)")
+            signalProcess(pid, signal: SIGTERM)
+        }
 
-        for pattern in patterns {
-            await runProcess("/usr/bin/pkill", arguments: ["-KILL", "-f", pattern])
+        await waitUntilGone(residualPIDs, timeout: residualShutdownTimeout)
+
+        let stubbornPIDs = residualPIDs.filter { isProcessRunning($0) }
+        for pid in stubbornPIDs.sorted() {
+            logger.info("Force terminating residual Codex helper pid=\(pid, privacy: .public)")
+            signalProcess(pid, signal: SIGKILL)
         }
     }
 
-    private func runProcess(_ executable: String, arguments: [String]) async {
+    private func collectCodexRelatedProcessIDs(rootPIDs: Set<Int32>) async -> Set<Int32> {
+        let processes = await processSnapshot()
+        let directMatches = Set(processes.compactMap { process -> Int32? in
+            if rootPIDs.contains(process.pid) || isCodexOwnedCommand(process.command) {
+                return process.pid
+            }
+            return nil
+        })
+
+        return directMatches.union(descendants(of: directMatches, in: processes))
+    }
+
+    private func descendants(of rootPIDs: Set<Int32>, in processes: [ProcessSnapshot]) -> Set<Int32> {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for process in processes {
+            childrenByParent[process.ppid, default: []].append(process.pid)
+        }
+
+        var result = Set<Int32>()
+        var queue = Array(rootPIDs)
+
+        while let pid = queue.popLast() {
+            for childPID in childrenByParent[pid, default: []] where !result.contains(childPID) {
+                result.insert(childPID)
+                queue.append(childPID)
+            }
+        }
+
+        return result
+    }
+
+    private func isCodexOwnedCommand(_ command: String) -> Bool {
+        let standardizedCodexPath = URL(fileURLWithPath: codexPath, isDirectory: true).standardizedFileURL.path
+        if command.hasPrefix(standardizedCodexPath + "/") {
+            return true
+        }
+
+        let codexComputerUseFragments = [
+            ".codex/computer-use/Codex Computer Use.app/",
+            ".codex/plugins/cache/openai-bundled/computer-use/",
+            ".codex/plugins/cache/openai-bundled/record-and-replay/"
+        ]
+        if command.contains("Codex Computer Use.app/"), codexComputerUseFragments.contains(where: command.contains) {
+            return true
+        }
+
+        return command.contains("SkyComputerUseService")
+            || command.contains("SkyComputerUseClient")
+            || command.contains("CUALockScreenGuardian")
+    }
+
+    private func processSnapshot() async -> [ProcessSnapshot] {
         await Task.detached {
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            process.standardOutput = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/bin/ps")
+            process.arguments = ["axo", "pid=,ppid=,command="]
+            let outputPipe = Pipe()
+            process.standardOutput = outputPipe
             process.standardError = Pipe()
+
             do {
                 try process.run()
                 process.waitUntilExit()
             } catch {
-                // If the target process is already gone, there is nothing else to do.
+                return []
+            }
+
+            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else {
+                return []
+            }
+
+            return output.split(separator: "\n").compactMap { line in
+                ProcessSnapshot(String(line))
             }
         }.value
+    }
+
+    private func signalProcess(_ pid: Int32, signal: Int32) {
+        _ = Darwin.kill(pid_t(pid), signal)
+    }
+
+    private func isProcessRunning(_ pid: Int32) -> Bool {
+        Darwin.kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    private func waitUntilGone(_ pids: Set<Int32>, timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if pids.allSatisfy({ !isProcessRunning($0) }) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
     }
 
     @MainActor
@@ -170,6 +264,31 @@ private final class CodexProxyLauncher {
             "--proxy-server=\(proxy.chromiumProxyServer)",
             "--proxy-bypass-list=localhost;127.0.0.1;::1"
         ]
+    }
+}
+
+private struct ProcessSnapshot {
+    let pid: Int32
+    let ppid: Int32
+    let command: String
+
+    init?(_ line: String) {
+        let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard parts.count == 3,
+              let pidValue = Int32(parts[0]),
+              let ppidValue = Int32(parts[1])
+        else {
+            return nil
+        }
+
+        let command = String(parts[2]).trimmingCharacters(in: .whitespaces)
+        guard !command.isEmpty else {
+            return nil
+        }
+
+        self.pid = pidValue
+        self.ppid = ppidValue
+        self.command = command
     }
 }
 
